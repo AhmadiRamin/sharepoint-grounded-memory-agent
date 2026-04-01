@@ -2,7 +2,7 @@
 
 A complete .NET 10 console application demonstrating long-term memory for Azure AI Foundry agents. The sample wraps the Foundry Memory Store REST API to show how to persist user preferences, context, and conversation summaries across sessions — without building your own embedding pipeline.
 
-> **Full walkthrough:** [Beyond Stateless Conversations: Adding Long-Term Memory to Your Foundry Agents](https://codingwithramin.com/?p=592)
+> **Full walkthrough:** [Building a SharePoint Agent That Remembers: Combining Memory + SharePoint Grounding](https://codingwithramin.com/?p=600)
 
 ---
 
