@@ -21,6 +21,7 @@ builder.Services.AddSingleton<SharePointMemoryAgent>();
 builder.Services.AddLogging(logging =>
 {
 	logging.AddConsole();
+	logging.SetMinimumLevel(LogLevel.Warning);
 });
 
 var host = builder.Build();

@@ -140,11 +140,7 @@ public class SharePointMemoryAgent
 		if (!created)
 			throw new InvalidOperationException("Failed to create or verify memory store");
 
-		var scopeHash = Math.Abs(_scope.GetHashCode()).ToString();
-		var agentName = $"SharePointMemoryAgent";
-
-		if (await TryGetExistingAgentAsync(agentName))
-			return;
+		var agentName = "SharePointMemoryAgent";
 
 		var sharepointConnectionId = await ResolveSharePointConnectionIdAsync();
 
@@ -202,12 +198,28 @@ public class SharePointMemoryAgent
 When responding:
 - Use what you know about the user from memory to tailor your answers. If you know
   they work in legal, emphasise compliance aspects. If they prefer summaries, be concise.
-- When you find relevant SharePoint documents, cite them naturally. Explain what you
-  found and why it's relevant to this user's question.
+- When you do search SharePoint and find relevant documents, ALWAYS cite them.
+  Include the document title and a direct link inline in your answer
+  (e.g. 'According to [Policy Name](url), ...'). Never use SharePoint content
+  without citing its source.
+- ONLY search SharePoint when the user is asking a question about company content,
+  policies, documents, or topics that would plausibly exist in enterprise documents.
+  Do NOT search SharePoint when the user is sharing personal information about
+  themselves (their role, preferences, department, working style, etc.). In those
+  cases, simply acknowledge what they said and store it — no SharePoint search needed.
+- When you do search SharePoint and find no relevant documents, do NOT mention the
+  failed search at all. Just answer from memory or acknowledge the user's message.
+- When a new session starts and you are given a summary of previous conversations,
+  IMMEDIATELY search SharePoint for the latest versions of any documents or topics
+  mentioned in that summary. Do this before the user asks — treat it as a required
+  step when resuming from prior sessions.
+- If a user asks about updates or new versions of something discussed before, ALWAYS
+  search SharePoint first. Never say you haven't searched — search, then answer.
 - If a user asks about something from a previous session, use that context naturally.
   Don't announce that you're recalling from memory.
 - If you're unsure whether stored context is still accurate, confirm with the user.
-- If a user shares new information about themselves, acknowledge it naturally.",
+- If a user shares new information about themselves, simply acknowledge it warmly and
+  confirm you have noted it. Do not recap all their stored profile back to them.",
 				tools
 			}
 		};
@@ -216,6 +228,7 @@ When responding:
 			JsonSerializer.Serialize(agentPayload),
 			Encoding.UTF8, "application/json");
 
+		// Try to create; if it already exists, update it via POST to the named resource
 		var response = await _httpClient.PostAsync(
 			$"{_endpoint}/agents?api-version={_agentApiVersion}", content);
 
@@ -230,8 +243,16 @@ When responding:
 
 		if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
 		{
+			// Agent exists — update it so instruction changes are applied
+			await SetAuthHeaderAsync();
+			var patchResponse = await _httpClient.PostAsync(
+				$"{_endpoint}/agents/{agentName}?api-version={_agentApiVersion}", content);
+
 			_agentName = agentName;
-			_logger.LogInformation("Agent '{Name}' already exists, reusing", _agentName);
+			if (patchResponse.IsSuccessStatusCode)
+				_logger.LogInformation("Agent '{Name}' updated with latest instructions", _agentName);
+			else
+				_logger.LogWarning("Agent '{Name}' exists but update failed; reusing as-is", _agentName);
 			return;
 		}
 
@@ -270,9 +291,31 @@ When responding:
 		if (totalLoaded > 0)
 			_logger.LogInformation("Loaded {Count} stored memories ({Static} user_profile, {Contextual} contextual) for this user",
 				totalLoaded, staticMemories.Count, contextualMemories.Count);
+
+		// If there are prior chat summaries, send a silent priming turn so the agent
+		// searches SharePoint for updated documents before the user's first message.
+		var summaries = contextualMemories
+			.Concat(staticMemories)
+			.Where(m => m.MemoryType == "chat_summary")
+			.Select(m => m.Content)
+			.Distinct(StringComparer.OrdinalIgnoreCase)
+			.ToList();
+
+		if (summaries.Count > 0)
+		{
+			var topicContext = string.Join("\n", summaries.Select((s, i) => $"- {s}"));
+			var primingMessage =
+				$"A new conversation session has started. Here is a summary of what we discussed previously:\n{topicContext}\n\n" +
+				"Please search SharePoint now for the latest versions of any documents, policies, or topics " +
+				"mentioned above. Retrieve and review the current content so you are ready to answer " +
+				"questions about any updates. Do not reply to the user yet — this is an internal preparation step.";
+
+			await SendMessageAsync(primingMessage, silent: true);
+			_logger.LogInformation("Sent priming turn to agent with {Count} chat summaries", summaries.Count);
+		}
 	}
 
-	public async Task<string> SendMessageAsync(string userMessage)
+	public async Task<string> SendMessageAsync(string userMessage, bool silent = false)
 	{
 		if (_conversationId == null || _agentName == null)
 			throw new InvalidOperationException(
@@ -350,14 +393,19 @@ When responding:
 			doc.RootElement.TryGetProperty("output_text", out var fallback))
 			outputText = fallback.GetString() ?? "";
 
-		// Update memory with the conversation turn so chat_summary entries are generated
-		if (!string.IsNullOrEmpty(outputText))
+		// Update memory with the conversation turn so chat_summary entries are generated.
+		// Skip for silent (priming) turns — they are internal and should not be memorised.
+		if (!silent && !string.IsNullOrEmpty(outputText))
 		{
 			_lastUpdateId = await _memoryService.UpdateMemoriesAsync(
 				_storeName, _scope, userMessage, outputText, _lastUpdateId);
 		}
 
-		// Deduplicate citations (same URL may appear multiple times)
+		// Deduplicate citations (same URL may appear multiple times).
+		// For silent priming turns, return empty string (caller discards the response).
+		if (silent)
+			return string.Empty;
+
 		var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 		var uniqueCitations = citations.Where(c => seen.Add(c)).ToList();
 
@@ -407,12 +455,13 @@ When responding:
 		var contextualMemories = await _memoryService.SearchMemoriesAsync(
 			_storeName, _scope, query: "previous conversations and user information");
 
-		// Merge, preferring contextual results and deduplicating by MemoryId
-		var seen = new HashSet<string>();
+		// Merge, preferring contextual results and deduplicating by MemoryId and by content
+		var seenIds = new HashSet<string>();
+		var seenContent = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 		var all = new List<MemoryItem>();
 		foreach (var m in contextualMemories.Concat(staticMemories))
 		{
-			if (seen.Add(m.MemoryId))
+			if (seenIds.Add(m.MemoryId) && seenContent.Add(m.Content.Trim()))
 				all.Add(m);
 		}
 
@@ -422,7 +471,7 @@ When responding:
 			return;
 		}
 
-		foreach (var m in all)
+		foreach (var m in all.OrderBy(m => m.MemoryType == "chat_summary" ? 0 : 1))
 			Console.WriteLine($"  [{m.MemoryType}] {m.Content}");
 	}
 

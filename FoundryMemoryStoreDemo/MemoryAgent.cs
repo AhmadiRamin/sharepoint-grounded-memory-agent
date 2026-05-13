@@ -278,12 +278,13 @@ public class MemoryAgent
 		var contextualMemories = await _memoryService.SearchMemoriesAsync(
 			_storeName, _scope, query: "previous conversations and user information");
 
-		// Merge, preferring contextual results and deduplicating by MemoryId
-		var seen = new HashSet<string>();
+		// Merge, preferring contextual results and deduplicating by MemoryId and by content
+		var seenIds = new HashSet<string>();
+		var seenContent = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 		var all = new List<MemoryItem>();
 		foreach (var m in contextualMemories.Concat(staticMemories))
 		{
-			if (seen.Add(m.MemoryId))
+			if (seenIds.Add(m.MemoryId) && seenContent.Add(m.Content.Trim()))
 				all.Add(m);
 		}
 
@@ -293,7 +294,7 @@ public class MemoryAgent
 			return;
 		}
 
-		foreach (var memory in all)
+		foreach (var memory in all.OrderBy(m => m.MemoryType == "chat_summary" ? 0 : 1))
 		{
 			Console.WriteLine($"  [{memory.MemoryType}] {memory.Content}");
 		}
