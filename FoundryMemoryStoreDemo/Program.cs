@@ -1,4 +1,8 @@
-﻿using FoundrySharePointMemoryAgent;
+﻿#pragma warning disable AAIP001
+
+using Azure.AI.Projects;
+using Azure.Identity;
+using FoundrySharePointMemoryAgent;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -13,9 +17,22 @@ var configuration = new ConfigurationBuilder()
 	.Build();
 
 builder.Services.AddSingleton<IConfiguration>(configuration);
-builder.Services.AddHttpClient<MemoryStoreService>();
-builder.Services.AddHttpClient<SharePointMemoryAgent>();
+
+// AIProjectClient is the SDK entry point; MemoryStoreService uses it instead of HttpClient
+builder.Services.AddSingleton<AIProjectClient>(sp =>
+{
+	var cfg = sp.GetRequiredService<IConfiguration>();
+	var endpoint = cfg["Foundry:ProjectEndpoint"]
+		?? throw new InvalidOperationException("Foundry:ProjectEndpoint not configured");
+	var tenantId = cfg["Foundry:TenantId"];
+	var credential = string.IsNullOrEmpty(tenantId)
+		? new DefaultAzureCredential()
+		: new DefaultAzureCredential(new DefaultAzureCredentialOptions { TenantId = tenantId });
+	return new AIProjectClient(new Uri(endpoint), credential);
+});
+
 builder.Services.AddSingleton<MemoryStoreService>();
+builder.Services.AddHttpClient<SharePointMemoryAgent>(); // still uses HttpClient for agent/conversation REST
 builder.Services.AddSingleton<SharePointMemoryAgent>();
 
 builder.Services.AddLogging(logging =>
